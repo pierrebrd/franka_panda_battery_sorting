@@ -37,8 +37,10 @@ except ImportError:
     cv2 = None
 
 try:  # robot side (frankapy environment)
+    import rospy
     from autolab_core import RigidTransform
     from frankapy import FrankaArm
+    from sensor_msgs.msg import JointState
 except ImportError:
     FrankaArm = None
 
@@ -77,6 +79,7 @@ PLACE_PAST_EDGE = 0.03     # the object is set down this far beyond the line of 
                            # so it is out of the detection area (it ends at marker centres)
 GRIP_FORCE = 20.0          # N
 MIN_GRIP_WIDTH = 0.002     # fingers closer than this after gripping: they missed the object
+GRIPPER_READ_TIMEOUT = 1.0 # s waited for the finger width; without it, the grasp is assumed to have worked
 MAX_ATTEMPTS = 2           # grasps tried on the same object before leaving it
 SETTLE_TIME = 1.5          # s waited at home, so the camera app tracks the objects again without the arm
 POLL_PERIOD = 0.5          # s between requests when there is nothing to pick
@@ -445,6 +448,22 @@ def gripper_pose(xy, height, closing=(0.0, -1.0)):
                           from_frame="franka_tool", to_frame="world")
 
 
+def gripper_width(fa):
+    """Distance between the fingers, or None if the gripper does not publish it.
+
+    fa.get_gripper_width() waits for the gripper joint states without a timeout, so it hangs for good
+    when nothing publishes them.
+    """
+    if getattr(fa, "_old_gripper", False):
+        return fa.get_gripper_width()
+    try:
+        state = rospy.wait_for_message(fa._gripper_joint_states_name, JointState, timeout=GRIPPER_READ_TIMEOUT)
+    except rospy.ROSException:
+        print(f"No gripper width on {fa._gripper_joint_states_name}: assuming the object is gripped.")
+        return None
+    return state.position[0] + state.position[1]
+
+
 def pick_and_place(fa, plan, height, grip=True):
     """Grips the object, sets it down outside the table area and goes back home.
 
@@ -457,7 +476,8 @@ def pick_and_place(fa, plan, height, grip=True):
     fa.goto_pose(gripper_pose(plan["grasp"], height, closing), duration=1.5)
     if grip:
         fa.goto_gripper(0.0, grasp=True, force=GRIP_FORCE)
-        if fa.get_gripper_width() < MIN_GRIP_WIDTH:
+        width = gripper_width(fa)
+        if width is not None and width < MIN_GRIP_WIDTH:
             fa.goto_gripper(opening)
             fa.goto_pose(gripper_pose(plan["grasp"], SAFE_HEIGHT, closing), duration=1.5)
             fa.reset_joints()
