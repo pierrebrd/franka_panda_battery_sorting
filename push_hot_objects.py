@@ -50,24 +50,20 @@ DEFAULT_PORT = 5055
 # table, y to the robot's left, z up. The webcam is upside down, so in its image x points up and y left.
 #
 # The four ArUco markers (DICT_4X4_50) at the table corners give the webcam -> robot mapping. Each
-# one is used through its inner corner, the one facing the table centre. Positions from ref/:
-#   - the robot-side edge of markers 0 and 1 is 25.5 cm in front of the robot base, whose axis is
-#     8 cm behind its front surface, and the robot axis passes midway between them;
-#   - the markers are 4.7 cm wide (measured on the photos), so their inner corners are 4.7 cm farther;
-#   - inner corners 0-1 are 47.5 cm apart, 0-2 47 cm, 1-3 45.5 cm and 2-3 41.5 cm. These lengths leave
-#     the sideways position of the far pair open: shifting it 5.5 cm towards the robot's right is what
-#     makes the markers come out square in both the measurement photo and the webcam image.
-# Replace them with measured robot positions (test_old/get_coords.py) if pushes miss their target.
+# one is used through its inner corner, the one facing the table centre, whose position was measured
+# with the robot (gripper tip on the corner, pose read with test_old/get_coords.py). The table is not
+# square to the robot: it is shifted ~2 cm to the robot's right and turned by a few degrees.
 MARKER_CORNERS = {
-    0: (0.382, -0.2375),   # near, robot's right (bottom right in the webcam image)
-    1: (0.382, 0.2375),    # near, robot's left (bottom left)
-    2: (0.849, -0.1825),   # far, robot's right (top right)
-    3: (0.837, 0.2325),    # far, robot's left (top left)
+    0: (0.36027, -0.2586),   # near, robot's right
+    1: (0.38831, 0.221),     # near, robot's left
+    2: (0.8248, -0.22999),   # far, robot's right
+    3: (0.83612, 0.18129),   # far, robot's left
 }
+MARKER_PLACES = {0: "bottom right", 1: "bottom left", 2: "top right", 3: "top left"}  # in the webcam image
 MARKER_CHECK_PERIOD = 2.0  # s between marker detections; the last mapping is kept while markers are hidden
 
 # ----- pushing ----------------------------------------------------------------------------------
-TABLE_Z = 0.0              # table surface height in the robot frame
+TABLE_Z = 0.02             # table surface height in the robot frame (gripper tip on the markers: 0.019 to 0.023)
 PUSH_HEIGHT = 0.01         # fingertip height above the table while pushing
 SAFE_HEIGHT = 0.12         # travel height above the table, clear of the objects
 HOVER_HEIGHT = 0.05        # --hover-only: the push path is followed at this height
@@ -154,17 +150,41 @@ def _distance(point, polygon):
 
 # ----- camera side ------------------------------------------------------------------------------
 
-def find_marker_corners(image):
-    """Inner corner (webcam pixels) of each table marker, or None unless all of them are visible."""
+def detect_table_markers(image):
+    """Outline (4x2 webcam pixels) of each table marker visible in the image, by marker id."""
     parameters = cv2.aruco.DetectorParameters()
+    # More tolerant than the defaults, which miss the small, slightly blurred markers of the webcam
+    # image. A wrong detection cannot slip through: all four must be found, in the right arrangement.
+    parameters.adaptiveThreshWinSizeMin = 3
+    parameters.adaptiveThreshWinSizeMax = 53
+    parameters.adaptiveThreshWinSizeStep = 4
+    parameters.polygonalApproxAccuracyRate = 0.08
+    parameters.minMarkerPerimeterRate = 0.01
+    parameters.minCornerDistanceRate = 0.01
+    parameters.perspectiveRemovePixelPerCell = 8
+    parameters.errorCorrectionRate = 1.0
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), parameters)
-    corners, ids, _ = detector.detectMarkers(image)
-    found = {} if ids is None else {int(i): c.reshape(4, 2) for i, c in zip(ids.ravel(), corners)}
-    if not all(i in found for i in MARKER_CORNERS):
+    found = {}
+    for scale in (1.0, 0.5):   # a blurred marker is sometimes only decoded at one of the scales
+        scaled = image if scale == 1.0 else cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        corners, ids, _ = detector.detectMarkers(scaled)
+        for i, outline in zip([] if ids is None else ids.ravel().tolist(), corners):
+            if i in MARKER_CORNERS and i not in found:
+                found[i] = outline.reshape(4, 2) / scale
+    return found
+
+
+def inner_corners(markers):
+    """Inner corner of each table marker, or None unless all four are found in the expected arrangement."""
+    if len(markers) < len(MARKER_CORNERS):
         return None
-    centre = np.mean([found[i].mean(axis=0) for i in MARKER_CORNERS], axis=0)
-    return {i: found[i][np.argmin(np.linalg.norm(found[i] - centre, axis=1))].tolist() for i in MARKER_CORNERS}
+    centre = np.mean([outline.mean(axis=0) for outline in markers.values()], axis=0)
+    inner = {i: outline[np.argmin(np.linalg.norm(outline - centre, axis=1))].tolist() for i, outline in markers.items()}
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = (inner[i] for i in range(4))
+    if not (x3 < x2 and x1 < x0 and y3 < y1 and y2 < y0):
+        return None
+    return inner
 
 
 class TableMapping:
@@ -189,10 +209,14 @@ class TableMapping:
         return self.H is not None
 
     def update(self, frame):
-        """Looks for the markers in a webcam frame. Returns whether all of them were found."""
-        corners = find_marker_corners(frame)
+        """Looks for the markers in a webcam frame and updates the mapping when all of them are found.
+
+        Returns the markers seen, as detect_table_markers().
+        """
+        markers = detect_table_markers(frame)
+        corners = inner_corners(markers)
         if corners is None:
-            return False
+            return markers
         if self.corners is None or max(np.hypot(*np.subtract(corners[i], self.corners[i])) for i in corners) > 2.0:
             moved = self.corners is not None
             self._set(corners)
@@ -200,7 +224,7 @@ class TableMapping:
             self.path.write_text(json.dumps({"image_size": self.image_size, "corners": corners,
                                              "saved": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2))
             print("Table markers found: webcam -> robot mapping " + ("updated (did the webcam move?)" if moved else "set"))
-        return True
+        return markers
 
     def _set(self, corners):
         ids = sorted(MARKER_CORNERS)
@@ -241,7 +265,7 @@ class RobotLink:
         self.threshold = threshold
         self.use_max = use_max
         self.report = {"objects": [], "error": "camera side starting"}
-        self.markers_visible = False
+        self.markers_seen = {}         # last detect_table_markers() result
         self._next_marker_check = 0.0
         self.server = ReportServer((HOST, port), self)
         threading.Thread(target=self.server.serve_forever, name="robot-link", daemon=True).start()
@@ -252,7 +276,7 @@ class RobotLink:
         app = self.app
         if time.monotonic() >= self._next_marker_check:
             self._next_marker_check = time.monotonic() + MARKER_CHECK_PERIOD
-            self.markers_visible = self.mapping.update(app.frame)
+            self.markers_seen = self.mapping.update(app.frame)
 
         tracks, objects = [], []
         if self.mapping.ready:
@@ -260,21 +284,26 @@ class RobotLink:
                 if not track.obj.touches_border and track.age >= STABLE_AGE:
                     tracks.append(track)
                     objects.append(self._describe(track))
-        if not self.mapping.ready:
-            error = "the webcam has not seen the four table markers yet"
+        missing = [i for i in sorted(MARKER_CORNERS) if i not in self.markers_seen]
+        if not self.mapping.ready and missing:
+            error = "the webcam cannot read marker " + ", ".join(f"{i} ({MARKER_PLACES[i]})" for i in missing)
+        elif not self.mapping.ready:
+            error = "the markers are not where expected (is the webcam upside down?)"
         elif app.mode != "run":
             error = f"the camera app is in {app.mode} mode"   # e.g. a hot mug used for calibration
         else:
             error = None
         self.report = {"objects": [] if error else objects, "error": error}
 
-        if app.mode == "run" and self.mapping.ready:
-            self._draw_mapping(canvas)
-            for track, obj in zip(tracks, objects):
-                self._draw_object(canvas, track, obj, [o for o in objects if o is not obj])
+        if app.mode == "run":
+            self._draw_markers(canvas)
+            if self.mapping.ready:
+                self._draw_reach(canvas)
+                for track, obj in zip(tracks, objects):
+                    self._draw_object(canvas, track, obj, [o for o in objects if o is not obj])
         status = f"robot link: {error}" if error else f"robot link: pushing objects above {self.threshold:g} C"
-        if self.mapping.ready and not self.markers_visible:
-            status += " (markers hidden, last mapping)"
+        if self.mapping.ready and missing:
+            status += " (saved mapping, marker {} hidden)".format(", ".join(map(str, missing)))
         width = cv2.getTextSize(status, ui.FONT, 0.5, 1)[0][0]
         ui.put_text(canvas, status, (app.layout.rgb_width - width - 10, 20), 0.5, (0, 165, 255) if error else ui.GREEN)
 
@@ -289,11 +318,20 @@ class RobotLink:
             "outline": np.round(self.mapping.to_robot(hull), 4).tolist(),
         }
 
-    def _draw_mapping(self, canvas):
+    def _draw_markers(self, canvas):
         L = self.app.layout
-        for corner in self.mapping.corners.values():
-            ui.draw_cross(canvas, L.rgb_points([corner])[0], ui.CYAN if self.markers_visible else ui.GREY, 14, 1)
-        # Reach limit of the arm at table height, only the part over the table
+        for i, outline in self.markers_seen.items():
+            outline = L.rgb_points(outline)
+            ui.draw_polygon(canvas, outline, ui.CYAN, 2)
+            ui.put_text(canvas, str(i), outline.max(axis=0) + (4, 0), 0.6, ui.CYAN)
+        if self.mapping.ready:
+            for i, corner in self.mapping.corners.items():
+                if i not in self.markers_seen:   # hidden marker: where the saved mapping has its inner corner
+                    ui.draw_cross(canvas, L.rgb_points([corner])[0], ui.GREY, 14, 1)
+
+    def _draw_reach(self, canvas):
+        """Reach limit of the arm at table height, only the part over the table."""
+        L = self.app.layout
         arc = [[MAX_REACH * math.cos(a), MAX_REACH * math.sin(a)] for a in np.linspace(-1.2, 1.2, 49)]
         ui.draw_polygon(canvas, L.rgb_points(self.mapping.to_pixels(arc)), ui.YELLOW, 1, closed=False)
         label = L.rgb_points(self.mapping.to_pixels([[MAX_REACH, 0.0]]))[0]

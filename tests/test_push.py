@@ -4,7 +4,9 @@ Run with: .venv/bin/python -m unittest discover -s tests
 """
 
 import tempfile
+import threading
 import unittest
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -21,6 +23,7 @@ PIXEL_CORNERS = {0: (815.8, 598.0), 1: (381.0, 606.2), 2: (833.0, 174.4), 3: (31
 ROBOT_TO_PIXELS = cv2.getPerspectiveTransform(np.float32([MARKER_CORNERS[i] for i in range(4)]),
                                               np.float32([PIXEL_CORNERS[i] for i in range(4)]))
 MARKER_SIZE = 0.047
+BACKGROUND = Path(__file__).resolve().parent.parent / "data" / "background.png"
 
 
 def robot_to_pixels(points):
@@ -56,7 +59,7 @@ class MappingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mapping = TableMapping(f"{tmp}/markers.json", RGB_SIZE)
             self.assertFalse(mapping.ready)
-            self.assertTrue(mapping.update(image))
+            self.assertEqual(sorted(mapping.update(image)), [0, 1, 2, 3])
             probe = [[0.45, -0.15], [0.6, 0.0], [0.75, 0.2]]
             np.testing.assert_allclose(mapping.to_robot(robot_to_pixels(probe)), probe, atol=0.003)
             np.testing.assert_allclose(mapping.to_pixels(probe), robot_to_pixels(probe), atol=1.5)
@@ -67,8 +70,23 @@ class MappingTests(unittest.TestCase):
             hidden = image.copy()
             u, v = np.round(PIXEL_CORNERS[2]).astype(int)
             cv2.rectangle(hidden, (u - 5, v - 60), (u + 60, v + 5), (230, 230, 230), -1)
-            self.assertFalse(mapping.update(hidden))
+            self.assertNotIn(2, mapping.update(hidden))
             np.testing.assert_allclose(mapping.H, reloaded.H)
+
+    def test_markers_in_the_wrong_arrangement_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping = TableMapping(f"{tmp}/markers.json", RGB_SIZE)
+            self.assertEqual(len(mapping.update(cv2.rotate(table_with_markers(), cv2.ROTATE_180))), 4)
+            self.assertFalse(mapping.ready)
+
+    @unittest.skipUnless(BACKGROUND.exists(), "no saved background")
+    def test_real_webcam_background(self):
+        """The saved empty-table image (downscaled and blurred by the app) still shows all four markers."""
+        image = cv2.resize(cv2.imread(str(BACKGROUND)), RGB_SIZE, interpolation=cv2.INTER_CUBIC)
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping = TableMapping(f"{tmp}/markers.json", RGB_SIZE)
+            self.assertEqual(sorted(mapping.update(image)), [0, 1, 2, 3])
+            self.assertTrue(mapping.ready)
 
 
 class PlanTests(unittest.TestCase):
@@ -110,12 +128,26 @@ class LinkTests(unittest.TestCase):
 
         server = ReportServer(("127.0.0.1", 0), Link())
         try:
-            import threading
             threading.Thread(target=server.serve_forever, daemon=True).start()
             self.assertEqual(fetch_report(server.server_address[1]), Link.report)
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_camera_side_names_the_marker_it_cannot_read(self):
+        image = table_with_markers()
+        u, v = np.round(PIXEL_CORNERS[0]).astype(int)
+        cv2.line(image, (u - 10, v - 10), (u + 60, v + 60), (20, 20, 20), 12)   # cable across marker 0
+        rgb = FakeRgbCamera(image)
+        with tempfile.TemporaryDirectory() as tmp:
+            app = App(rgb, SimulatedThermalCamera(rgb).start(), tmp)
+            link = RobotLink(app, TableMapping(f"{tmp}/markers.json", RGB_SIZE), 40.0, False, 0)
+            try:
+                link.update(app.step())
+                self.assertEqual(link.report["error"], "the webcam cannot read marker 0 (bottom right)")
+            finally:
+                link.server.shutdown()
+                link.server.server_close()
 
     def test_camera_side_reports_hot_object_in_robot_coordinates(self):
         """App + simulated thermal camera (dark = hot): a black disk is ~47 C."""
