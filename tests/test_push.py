@@ -1,4 +1,4 @@
-"""Hardware-free tests of push_hot_objects.py: marker mapping, push planning and the camera/robot link.
+"""Hardware-free tests of push_hot_objects.py: marker mapping, grasp planning and the camera/robot link.
 
 Run with: .venv/bin/python -m unittest discover -s tests
 """
@@ -11,8 +11,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from push_hot_objects import (FINGER_HALF_WIDTH, MARKER_CORNERS, MAX_REACH, ReportServer, RobotLink, TableMapping,
-                              edge_y, fetch_report, plan_push)
+from push_hot_objects import (MARKER_CORNERS, MAX_REACH, PLACE_PAST_EDGE, ReportServer, RobotLink, TableMapping,
+                              edge_y, fetch_report, plan_grasp)
 from test_pipeline import RGB_SIZE, FakeRgbCamera, add_disk
 from thermal_table.app import STABLE_AGE, App
 from thermal_table.calibration import Calibration
@@ -89,32 +89,46 @@ class MappingTests(unittest.TestCase):
             self.assertTrue(mapping.ready)
 
 
-class PlanTests(unittest.TestCase):
-    def test_pushes_towards_the_nearer_side_out_of_the_table_area(self):
-        for y, side in ((0.08, 1), (-0.05, -1)):
-            start, end = plan_push(disk(0.55, y), [])
-            self.assertAlmostEqual(start[0], 0.55)
-            self.assertAlmostEqual(end[0], 0.55)
-            self.assertLess(side * start[1], side * y - 0.015 - FINGER_HALF_WIDTH)   # comes down beside the object
-            # The object, in front of the fingers, ends past the detection area (marker centres)
-            self.assertGreater(side * (end[1] - edge_y(end[0], side)) + FINGER_HALF_WIDTH, MARKER_SIZE / 2)
+def box(x, y, length, width, id=1, temp=50.0):
+    """Rectangle object, length along x and width along y."""
+    outline = [[x - length / 2, y - width / 2], [x + length / 2, y - width / 2],
+               [x + length / 2, y + width / 2], [x - length / 2, y + width / 2]]
+    return {"id": id, "temp": temp, "hot": True, "center": [x, y], "outline": outline}
 
-    def test_avoids_the_side_where_another_object_is_in_the_way(self):
-        start, end = plan_push(disk(0.55, 0.06), [disk(0.55, 0.16, id=2)])
-        self.assertLess(end[1], 0)
-        start, end = plan_push(disk(0.55, 0.06), [disk(0.40, 0.16, id=2)])  # not in the way
-        self.assertGreater(end[1], 0)
+
+class PlanTests(unittest.TestCase):
+    def test_sets_down_beyond_the_nearer_side_of_the_table_area(self):
+        for y, side in ((0.08, 1), (-0.05, -1)):
+            target = disk(0.55, y)
+            plan = plan_grasp(target, [])
+            np.testing.assert_allclose(plan["grasp"], [0.55, y], atol=1e-3)
+            self.assertAlmostEqual(plan["place"][0], 0.55)
+            # The whole object, carried as gripped, ends past the edge of the table area
+            outline = np.asarray(target["outline"]) - plan["grasp"] + plan["place"]
+            self.assertGreaterEqual(np.min(side * (outline[:, 1] - edge_y(0.55, side))), PLACE_PAST_EDGE - 1e-9)
+
+    def test_grips_across_the_narrowest_width(self):
+        plan = plan_grasp(box(0.55, 0.0, 0.06, 0.02), [])   # long along x: the fingers close along y
+        np.testing.assert_allclose(np.abs(plan["closing"]), [0, 1], atol=1e-9)
+        self.assertAlmostEqual(plan["width"], 0.02)
+        self.assertGreater(plan["opening"], plan["width"])
+
+    def test_too_wide_objects_are_left(self):
+        self.assertIsNone(plan_grasp(box(0.55, 0.0, 0.09, 0.09), []))
 
     def test_fingers_do_not_come_down_on_another_object(self):
-        # Pushing towards the nearer side (+y) would need the fingers right where the other object is
-        start, end = plan_push(disk(0.55, 0.10), [disk(0.55, 0.05, id=2)])
-        self.assertLess(end[1], 0)
+        # Closing along y would put a finger on the neighbour, so the fingers close along x
+        plan = plan_grasp(box(0.55, 0.0, 0.05, 0.04), [disk(0.55, 0.05, id=2)])
+        np.testing.assert_allclose(np.abs(plan["closing"]), [1, 0], atol=1e-9)
+        ring = [disk(0.55 + 0.045 * np.cos(a), 0.045 * np.sin(a), id=2 + i)
+                for i, a in enumerate(np.linspace(0, 2 * np.pi, 8, endpoint=False))]
+        self.assertIsNone(plan_grasp(disk(0.55, 0.0), ring))   # no room for the fingers
 
-    def test_far_objects_are_pushed_diagonally_or_left(self):
-        start, end = plan_push(disk(0.74, 0.0), [])
-        self.assertLess(end[0], 0.74)
-        self.assertLessEqual(max(np.hypot(*start), np.hypot(*end)), MAX_REACH + 1e-9)
-        self.assertIsNone(plan_push(disk(0.80, 0.0), []))
+    def test_far_objects_are_set_down_closer_and_unreachable_ones_left(self):
+        plan = plan_grasp(disk(0.75, 0.0), [])
+        self.assertLess(plan["place"][0], 0.75)
+        self.assertLessEqual(max(np.hypot(*plan["grasp"]), np.hypot(*plan["place"])), MAX_REACH + 1e-9)
+        self.assertIsNone(plan_grasp(disk(0.80, 0.0), []))
 
     def test_edges_go_through_the_marker_corners(self):
         for i, side in ((0, -1), (1, 1), (2, -1), (3, 1)):
@@ -170,13 +184,13 @@ class LinkTests(unittest.TestCase):
                 self.assertEqual(len(objects), 1)
                 np.testing.assert_allclose(objects[0]["center"], [0.6, 0.05], atol=0.005)
                 self.assertTrue(objects[0]["hot"])
-                self.assertIsNotNone(plan_push(objects[0], []))
+                self.assertIsNotNone(plan_grasp(objects[0], []))
 
                 link.threshold = 60.0
                 link.update(app.step())
                 self.assertFalse(link.report["objects"][0]["hot"])
 
-                app.on_key(ord("c"))   # e.g. a hot mug used for calibration must not be pushed
+                app.on_key(ord("c"))   # e.g. a hot mug used for calibration must not be picked
                 link.update(app.step())
                 self.assertEqual(link.report["objects"], [])
                 self.assertIn("calibrate", link.report["error"])

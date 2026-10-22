@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pushes the objects hotter than a threshold off the thermal table with the Franka arm.
+"""Picks the objects hotter than a threshold off the thermal table with the Franka arm.
 
 The camera app and frankapy need different Python environments (the .venv with Python 3.13 and the
 Optris SDK, and the ROS Python of frankapy), so this file runs as two processes on the same machine:
@@ -9,11 +9,12 @@ Optris SDK, and the ROS Python of frankapy), so this file runs as two processes 
 
 The camera side is the thermal table app. It also finds the ArUco markers at the table corners in the
 webcam image, maps the detected objects into robot coordinates and serves them on a local TCP port.
-The robot side waits at home, asks for the objects, pushes the hottest one above the threshold
-sideways out of the table area, goes home again so the cameras see the table, and repeats.
+The robot side waits at home, asks for the objects, grips the hottest one above the threshold, sets
+it down just outside the nearer side of the table area, goes home again so the cameras see the table,
+and repeats.
 
-To check the setup without risk, start the robot side with --dry-run (no motion, prints the pushes it
-would do) and then --hover-only (follows each push path 5 cm above the table).
+To check the setup without risk, start the robot side with --dry-run (no motion, prints the grasps it
+would do) and then --hover-only (follows each grasp path 5 cm above the table, without gripping).
 """
 
 import argparse
@@ -62,20 +63,23 @@ MARKER_CORNERS = {
 MARKER_PLACES = {0: "bottom right", 1: "bottom left", 2: "top right", 3: "top left"}  # in the webcam image
 MARKER_CHECK_PERIOD = 2.0  # s between marker detections; the last mapping is kept while markers are hidden
 
-# ----- pushing ----------------------------------------------------------------------------------
+# ----- gripping ---------------------------------------------------------------------------------
 TABLE_Z = 0.02             # table surface height in the robot frame (gripper tip on the markers: 0.019 to 0.023)
-PUSH_HEIGHT = 0.01         # fingertip height above the table while pushing
+GRASP_HEIGHT = 0.01        # fingertip height above the table when gripping and setting down
 SAFE_HEIGHT = 0.12         # travel height above the table, clear of the objects
-HOVER_HEIGHT = 0.05        # --hover-only: the push path is followed at this height
+HOVER_HEIGHT = 0.05        # --hover-only: the grasp path is followed at this height
 MAX_REACH = 0.77           # m from the robot axis. Pointing down at table height, the arm is fully
                            # stretched at 0.795 m (Panda kinematics), so the far strip is out of reach.
-FINGER_HALF_WIDTH = 0.01   # half the width of the closed fingertips
-APPROACH_GAP = 0.025       # gap left between fingertips and object when the gripper comes down
-PUSH_PAST_EDGE = 0.0     # the fingertips stop this far beyond the line of inner marker corners, so the
-                           # object in front of them ends past the detection area (it ends at marker centres)
-PUSH_SPEED = 0.08          # m/s
+MAX_OPENING = 0.08         # Franka Hand stroke (distance between the fingers fully open)
+FINGER_HALF_WIDTH = 0.01   # half the size of a fingertip, seen from above
+GRIP_MARGIN = 0.012        # gap left on each side between fingers and object when the gripper comes down
+PLACE_PAST_EDGE = 0.03     # the object is set down this far beyond the line of inner marker corners,
+                           # so it is out of the detection area (it ends at marker centres)
+GRIP_FORCE = 20.0          # N
+MIN_GRIP_WIDTH = 0.002     # fingers closer than this after gripping: they missed the object
+MAX_ATTEMPTS = 2           # grasps tried on the same object before leaving it
 SETTLE_TIME = 1.5          # s waited at home, so the camera app tracks the objects again without the arm
-POLL_PERIOD = 0.5          # s between requests when there is nothing to push
+POLL_PERIOD = 0.5          # s between requests when there is nothing to pick
 GRIPPER_DOWN = np.array([  # same orientation as the sweep in test_old/test.py
     [1, 0, 0],
     [0, -1, 0],
@@ -83,7 +87,7 @@ GRIPPER_DOWN = np.array([  # same orientation as the sweep in test_old/test.py
 ])
 
 
-# ----- push planning (pure geometry, shared by both sides) --------------------------------------
+# ----- grasp planning (pure geometry, shared by both sides) -------------------------------------
 
 def edge_y(x, side):
     """y of a side edge of the table area (line through the inner marker corners) at distance x.
@@ -94,41 +98,66 @@ def edge_y(x, side):
     return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
 
 
-def plan_push(target, others):
-    """Fingertip path (start, end) that pushes target sideways out of the table area, or None.
+def plan_grasp(target, others):
+    """How to pick target and where to set it down, or None if it cannot be done.
 
     target and others are objects as served by the camera side ("center" and "outline" in robot
-    coordinates). The object goes to the nearer side, unless another object is in the way only on
-    that side. Near the far end of the table, the end point is pulled back within reach, so the push
-    goes diagonally towards the robot.
+    coordinates). Returns a dict with "grasp" and "place" (fingertip centre, x y), "closing" (unit
+    vector along which the fingers close), "width" (object width between the fingers) and "opening"
+    (finger opening when coming down).
+
+    The fingers close across the narrowest width of the object that fits in the gripper with both
+    fingers coming down clear of the other objects. The object is set down just outside the nearer
+    side of the table area, pulled back towards the robot if that is out of reach.
     """
-    center = np.asarray(target["center"], float)
     outline = np.asarray(target["outline"], float)
-    plans = []
-    for side in (1, -1):
-        y_end = edge_y(center[0], side) + side * PUSH_PAST_EDGE
-        if side * (y_end - center[1]) <= 0 or abs(y_end) >= MAX_REACH:
+    others = [np.asarray(o["outline"], float) for o in others]
+    grasps = []
+    for direction in _edge_normals(outline):
+        along, _ = _project(outline, np.zeros(2), direction)
+        width = float(along.max() - along.min())
+        opening = width + 2 * GRIP_MARGIN
+        if opening > MAX_OPENING:
             continue
-        end = np.array([min(center[0], math.sqrt(MAX_REACH ** 2 - y_end ** 2)), y_end])
-        length = float(np.linalg.norm(end - center))
-        direction = (end - center) / length
-        along, across = _project(outline, center, direction)
-        start = center - direction * (max(0.0, -along.min()) + FINGER_HALF_WIDTH + APPROACH_GAP)
-        if np.hypot(*start) > MAX_REACH:
+        # Fingertip centre: midway between the two sides of the object, through its centre otherwise
+        center = np.asarray(target["center"], float)
+        grasp = center + direction * ((along.max() + along.min()) / 2 - center @ direction)
+        if np.hypot(*grasp) > MAX_REACH:
             continue
-        if any(_distance(start, np.asarray(o["outline"], float)) < APPROACH_GAP for o in others):
-            continue  # the fingers would come down on (or within 1.5 cm of) another object
-        # Objects the target would run into on its way
-        half_width = max(np.abs(across).max(), FINGER_HALF_WIDTH)
-        blocked = False
-        for other in others:
-            o_along, o_across = _project(np.asarray(other["outline"], float), center, direction)
-            blocked |= bool(np.any((o_along > 0) & (o_along < length + along.max()) & (np.abs(o_across) < half_width)))
-        plans.append((blocked, length, start, end))
-    if not plans:
+        fingers = [grasp + sign * direction * (opening / 2 + FINGER_HALF_WIDTH) for sign in (1, -1)]
+        if any(_distance(f, o) < FINGER_HALF_WIDTH for f in fingers for o in others):
+            continue  # a finger would come down on (or right next to) another object
+        grasps.append((width, opening, grasp, direction))
+    if not grasps:
         return None
-    _, _, start, end = min(plans, key=lambda plan: plan[:2])
-    return start, end
+    width, opening, grasp, direction = min(grasps, key=lambda g: g[0])
+
+    places = []
+    for side in (1, -1):
+        # The whole object, carried as it is gripped, must end PLACE_PAST_EDGE beyond the edge
+        inward = float(np.max(side * (grasp[1] - outline[:, 1])))
+        x = grasp[0]
+        for _ in range(5):   # pulling x back moves the slanted edge a little, so y is updated and so on
+            y = edge_y(x, side) + side * (PLACE_PAST_EDGE + inward)
+            if abs(y) >= MAX_REACH:
+                break
+            x = min(grasp[0], math.sqrt(MAX_REACH ** 2 - y ** 2))
+        place = np.array([x, edge_y(x, side) + side * (PLACE_PAST_EDGE + inward)])
+        if np.hypot(*place) > MAX_REACH + 1e-4:
+            continue
+        places.append((float(np.linalg.norm(place - grasp)), place))
+    if not places:
+        return None
+    return {"grasp": grasp, "place": min(places, key=lambda p: p[0])[1], "closing": direction,
+            "width": width, "opening": opening}
+
+
+def _edge_normals(polygon):
+    """Unit normals of the edges of a polygon (the narrowest width of a convex one is along one of them)."""
+    edges = np.roll(polygon, -1, axis=0) - polygon
+    lengths = np.linalg.norm(edges, axis=1)
+    edges = edges[lengths > 1e-9] / lengths[lengths > 1e-9, None]
+    return np.stack([-edges[:, 1], edges[:, 0]], axis=1)
 
 
 def _project(points, origin, direction):
@@ -301,7 +330,7 @@ class RobotLink:
                 self._draw_reach(canvas)
                 for track, obj in zip(tracks, objects):
                     self._draw_object(canvas, track, obj, [o for o in objects if o is not obj])
-        status = f"robot link: {error}" if error else f"robot link: pushing objects above {self.threshold:g} C"
+        status = f"robot link: {error}" if error else f"robot link: picking objects above {self.threshold:g} C"
         if self.mapping.ready and missing:
             status += " (saved mapping, marker {} hidden)".format(", ".join(map(str, missing)))
         width = cv2.getTextSize(status, ui.FONT, 0.5, 1)[0][0]
@@ -342,7 +371,7 @@ class RobotLink:
         x, y, _, h = track.obj.bbox
         text = f"x {obj['center'][0]:.2f}  y {obj['center'][1]:+.2f} m"
         if obj["hot"]:
-            text += "  HOT: " + ("push" if plan_push(obj, others) is not None else "out of reach")
+            text += "  HOT: " + ("grip" if plan_grasp(obj, others) is not None else "cannot grip")
         ui.put_text(canvas, text, (x * L.rgb_scale, (y + h) * L.rgb_scale + 16), 0.45, ui.RED if obj["hot"] else ui.WHITE)
 
 
@@ -368,7 +397,7 @@ def camera_main(args):
             print(f"Thermal camera: {thermal.description}")
         except ThermalUnavailable as ex:
             thermal_error = str(ex)
-            print(f"WARNING: {thermal_error}\nNo temperatures, so nothing will be pushed.")
+            print(f"WARNING: {thermal_error}\nNo temperatures, so nothing will be picked.")
 
     app = App(rgb, thermal, data_dir, thermal_error)
     # The markers belong to the webcam setup, so the mapping is shared with --simulate-thermal
@@ -404,18 +433,42 @@ def fetch_report(port):
             return json.loads(reply.readline().decode())
 
 
-def gripper_pose(xy, height):
-    return RigidTransform(rotation=GRIPPER_DOWN, translation=np.array([xy[0], xy[1], TABLE_Z + height]),
+def gripper_pose(xy, height, closing=(0.0, -1.0)):
+    """Gripper pointing down at (x, y, TABLE_Z + height), its fingers closing along closing (x y)."""
+    # GRIPPER_DOWN closes the fingers along world -y. Turn it about z to close along closing, by the
+    # smaller angle (closing and -closing are the same grasp), so the wrist turns at most 90 degrees.
+    yaw = math.atan2(closing[0], -closing[1])
+    yaw = (yaw + math.pi / 2) % math.pi - math.pi / 2
+    c, s = math.cos(yaw), math.sin(yaw)
+    rotation = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]) @ GRIPPER_DOWN
+    return RigidTransform(rotation=rotation, translation=np.array([xy[0], xy[1], TABLE_Z + height]),
                           from_frame="franka_tool", to_frame="world")
 
 
-def push(fa, start, end, height):
-    """Comes down next to the object, pushes it from start to end, and goes back home."""
-    fa.goto_pose(gripper_pose(start, SAFE_HEIGHT), duration=3.0)
-    fa.goto_pose(gripper_pose(start, height), duration=1.5)
-    fa.goto_pose(gripper_pose(end, height), duration=max(1.0, float(np.linalg.norm(end - start)) / PUSH_SPEED))
-    fa.goto_pose(gripper_pose(end, SAFE_HEIGHT), duration=1.5)
+def pick_and_place(fa, plan, height, grip=True):
+    """Grips the object, sets it down outside the table area and goes back home.
+
+    Returns False if the fingers closed on nothing; the arm then goes straight back home.
+    With grip=False, only follows the path at height, with the gripper open.
+    """
+    closing, opening = plan["closing"], plan["opening"]
+    fa.goto_pose(gripper_pose(plan["grasp"], SAFE_HEIGHT, closing), duration=3.0)
+    fa.goto_gripper(opening)
+    fa.goto_pose(gripper_pose(plan["grasp"], height, closing), duration=1.5)
+    if grip:
+        fa.goto_gripper(0.0, grasp=True, force=GRIP_FORCE)
+        if fa.get_gripper_width() < MIN_GRIP_WIDTH:
+            fa.goto_gripper(opening)
+            fa.goto_pose(gripper_pose(plan["grasp"], SAFE_HEIGHT, closing), duration=1.5)
+            fa.reset_joints()
+            return False
+    fa.goto_pose(gripper_pose(plan["grasp"], SAFE_HEIGHT, closing), duration=1.5)
+    fa.goto_pose(gripper_pose(plan["place"], SAFE_HEIGHT, closing), duration=3.0)
+    fa.goto_pose(gripper_pose(plan["place"], height, closing), duration=1.5)
+    fa.goto_gripper(opening)
+    fa.goto_pose(gripper_pose(plan["place"], SAFE_HEIGHT, closing), duration=1.5)
     fa.reset_joints()
+    return True
 
 
 def robot_main(args):
@@ -425,8 +478,9 @@ def robot_main(args):
             raise SystemExit("frankapy not found: run the robot side in the frankapy environment (or use --dry-run).")
         fa = FrankaArm()
         fa.reset_joints()
-        fa.close_gripper()
+        fa.open_gripper()
     done = set()   # camera track ids not to handle again
+    attempts = {}  # camera track id -> grasps tried
     last_problem = None
     print("Waiting for hot objects (Ctrl+C to stop)...")
     try:
@@ -440,6 +494,7 @@ def robot_main(args):
                 print(f"Waiting: {problem}" if problem else "Camera side ready.")
                 last_problem = problem
                 done.clear()   # track ids start again from 1 when the camera side restarts
+                attempts.clear()
             if problem:
                 time.sleep(1.0)
                 continue
@@ -449,20 +504,28 @@ def robot_main(args):
                 time.sleep(POLL_PERIOD)
                 continue
             target = max(hot, key=lambda o: o["temp"])
-            path = plan_push(target, [o for o in report["objects"] if o is not target])
+            plan = plan_grasp(target, [o for o in report["objects"] if o is not target])
             description = "object #{} ({:.1f} C) at x={:.3f} y={:.3f} m".format(target["id"], target["temp"],
                                                                                *target["center"])
-            if path is None:
-                print(f"Leaving {description}: out of reach, or other objects are in the way.")
+            if plan is None:
+                print(f"Leaving {description}: out of reach, too wide, or other objects are in the way.")
                 done.add(target["id"])
                 continue
-            start, end = path
-            print(f"Pushing {description}: fingertips from ({start[0]:.3f}, {start[1]:.3f}) "
-                  f"to ({end[0]:.3f}, {end[1]:.3f})")
+            grasp, place = plan["grasp"], plan["place"]
+            print(f"Picking {description}: {plan['width'] * 100:.1f} cm wide, gripped at "
+                  f"({grasp[0]:.3f}, {grasp[1]:.3f}), set down at ({place[0]:.3f}, {place[1]:.3f})")
             if fa is None or args.hover_only:
                 done.add(target["id"])   # the object does not move, do not do it again
             if fa is not None:
-                push(fa, start, end, HOVER_HEIGHT if args.hover_only else PUSH_HEIGHT)
+                if args.hover_only:
+                    pick_and_place(fa, plan, HOVER_HEIGHT, grip=False)
+                elif not pick_and_place(fa, plan, GRASP_HEIGHT):
+                    attempts[target["id"]] = attempts.get(target["id"], 0) + 1
+                    if attempts[target["id"]] >= MAX_ATTEMPTS:
+                        print(f"Missed it {MAX_ATTEMPTS} times, leaving it.")
+                        done.add(target["id"])
+                    else:
+                        print("Missed it, trying again.")
                 time.sleep(SETTLE_TIME)
     except KeyboardInterrupt:
         print("Stopped.")
@@ -471,13 +534,13 @@ def robot_main(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Push the objects hotter than a threshold off the table.")
+    parser = argparse.ArgumentParser(description="Pick the objects hotter than a threshold off the table.")
     sides = parser.add_subparsers(dest="side")
     sides.required = True
 
     camera = sides.add_parser("camera", help="thermal table app that serves the objects (run with .venv/bin/python)")
     camera.add_argument("--threshold", type=float, default=40.0,
-                        help="objects at least this hot (degrees C) are pushed (default: 40)")
+                        help="objects at least this hot (degrees C) are picked (default: 40)")
     camera.add_argument("--use-max", action="store_true",
                         help="compare the hottest part of each object with the threshold instead of its median")
     camera.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TCP port (default: {DEFAULT_PORT})")
@@ -489,12 +552,12 @@ def main():
     camera.add_argument("--data-dir", type=Path, default=HERE / "data",
                         help="where the camera app's setup and the marker positions are stored")
 
-    robot = sides.add_parser("robot", help="pushes the hot objects (run in the frankapy environment)")
+    robot = sides.add_parser("robot", help="picks the hot objects (run in the frankapy environment)")
     robot.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TCP port (default: {DEFAULT_PORT})")
     check = robot.add_mutually_exclusive_group()
-    check.add_argument("--dry-run", action="store_true", help="do not move, only print the pushes")
+    check.add_argument("--dry-run", action="store_true", help="do not move, only print the grasps")
     check.add_argument("--hover-only", action="store_true",
-                       help=f"follow each push path {HOVER_HEIGHT * 100:.0f} cm above the table instead of pushing")
+                       help=f"follow each grasp path {HOVER_HEIGHT * 100:.0f} cm above the table without gripping")
 
     args = parser.parse_args()
     if args.side == "camera":
