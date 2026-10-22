@@ -71,7 +71,7 @@ MAX_REACH = 0.77           # m from the robot axis. Pointing down at table heigh
                            # stretched at 0.795 m (Panda kinematics), so the far strip is out of reach.
 FINGER_HALF_WIDTH = 0.01   # half the width of the closed fingertips
 APPROACH_GAP = 0.025       # gap left between fingertips and object when the gripper comes down
-PUSH_PAST_EDGE = 0.035     # the fingertips stop this far beyond the line of inner marker corners, so the
+PUSH_PAST_EDGE = 0.0     # the fingertips stop this far beyond the line of inner marker corners, so the
                            # object in front of them ends past the detection area (it ends at marker centres)
 PUSH_SPEED = 0.08          # m/s
 SETTLE_TIME = 1.5          # s waited at home, so the camera app tracks the objects again without the arm
