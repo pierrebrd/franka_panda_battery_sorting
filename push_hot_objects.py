@@ -75,7 +75,7 @@ MAX_REACH = 0.77           # m from the robot axis. Pointing down at table heigh
 MAX_OPENING = 0.08         # Franka Hand stroke (distance between the fingers fully open)
 FINGER_HALF_WIDTH = 0.01   # half the size of a fingertip, seen from above
 GRIP_MARGIN = 0.012        # gap left on each side between fingers and object when the gripper comes down
-PLACE_PAST_EDGE = 0.03     # the object is set down this far beyond the line of inner marker corners,
+PLACE_PAST_EDGE = -0.02     # the object is set down this far beyond the line of inner marker corners,
                            # so it is out of the detection area (it ends at marker centres)
 GRIP_FORCE = 20.0          # N
 MIN_GRIP_WIDTH = 0.002     # fingers closer than this after gripping: they missed the object
