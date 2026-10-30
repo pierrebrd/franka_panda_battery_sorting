@@ -473,7 +473,7 @@ def play_sound(filename):
         print(f"Sound not played, no such file: {path}")
         return None
     try:
-        return subprocess.Popen(["aplay", "-q", "-D", AUDIO_DEVICE, str(path)])
+        return subprocess.Popen(["aplay", str(path)])
     except OSError as ex:
         print(f"Sound not played ({ex})")
         return None
@@ -494,20 +494,18 @@ def wave_hello(fa):
 
     sound = play_sound(HELLO_AUDIO)
     joints[2] += WAVE_AMPLITUDE
-    fa.goto_joints(joints, duration=WAVE_DURATION / 2)
+    fa.goto_joints(joints, duration=WAVE_DURATION)
     for direction in (-1, 1, -1):
         joints[2] += direction * 2 * WAVE_AMPLITUDE
         fa.goto_joints(joints, duration=WAVE_DURATION)
     wait_sound(sound)
 
 
-def point_at_table(fa):
-    """Asks for an object while pointing at the table in one quick gesture, then goes back home."""
+def give_instructions(fa):
+    """Asks for an object while resetting the joints."""
     sound = play_sound(PLACE_OBJECT_AUDIO)
-    fa.goto_joints(POINT_JOINTS, duration=POINT_DURATION)
-    time.sleep(POINT_HOLD)
-    wait_sound(sound)
     fa.reset_joints()
+    wait_sound(sound)
 
 
 def greet(fa):
@@ -517,7 +515,7 @@ def greet(fa):
         wait_sound(play_sound(PLACE_OBJECT_AUDIO))
         return
     wave_hello(fa)
-    point_at_table(fa)
+    give_instructions(fa)
 
 
 def fetch_report(port):
