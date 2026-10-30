@@ -1,3 +1,7 @@
+## Usage
+
+Do not use push_hot_objects.py, but rather the newer whole_cycle.py, with the --drop argument if you want to drop the objects after picking them, instead of replacing them on the table.
+
 ## Tips
 
 When the robot encounters an error or you push the emergency stops button (the led of the robot goes white), you need to ctrl+c the 3 terminal commands (franka-interface, franka_ros_interface, franka gripper), and restart them in the right order.
@@ -6,9 +10,11 @@ If you want to see the actual postion of the robot head/gripper, kill the termin
 
 You should also be able to launh rviz while running this repo's code by opening rviz and opening the rviz config without using the franka_visualisation.launch file.
 
-## Modifications made:
+## Modifications made in the docker image:
 
-If you have virtual walls errors (either the program stops on an error or a movement is canceled), you can try to change the virtual walls positions by editing the hyperplanes in `~/franka-interface/include/franka-interface/termination_handler/termination_handler.h`
+### Virtual walls
+
+If you have virtual walls errors (either the program stops on an error or a movement is canceled, or a movement is weird and stuck), you can try to change the virtual walls positions by editing the hyperplanes in `~/franka-interface/include/franka-interface/termination_handler/termination_handler.h`
 
 then build the interface wih 
 ```
@@ -16,7 +22,18 @@ cd ~/franka-interface/build
 make -j4
 ```
 
+### Other modifications
+
+- To use aplay to play audio, `sudo apt install alsa-utils`
+
+
 ## Logs from last runs 
+
+The franka interface often gives error of this kind, it does not affect the robot movement (but I'm not sure)
+
+```
+Robot state save thread encountered Franka exception. Will not log for now.
+```
 
 Some logs obtained during the execution of the code in this branch.
 
