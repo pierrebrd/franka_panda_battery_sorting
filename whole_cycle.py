@@ -22,11 +22,15 @@ prints the grasps it would do) and then --hover-only (follows each grasp path 5 
 import argparse
 import json
 import math
+import select
 import socket
 import socketserver
 import subprocess
+import sys
+import termios
 import threading
 import time
+import tty
 from pathlib import Path
 
 import numpy as np
@@ -104,6 +108,7 @@ AUDIO_DEVICE = "plughw:1,0"   # plughw instead of hw: aplay then converts any sa
 HELLO_AUDIO = "welcome.wav"
 PLACE_OBJECT_AUDIO = "place_battery.wav"
 TOO_HOT_AUDIO = "battery_too_hot.wav"     # said once for each hot object, when the robot goes for it
+THANKING_AUDIO = "thanking_end.wav"
 WAVE_AMPLITUDE = np.deg2rad(15)  # side to side around the raised pose
 WAVE_DURATION = 1.0              # s for one swing from side to side
 # Arm stretched forwards, gripper aimed at the centre of the table: the line through the fingers hits
@@ -518,6 +523,10 @@ def greet(fa):
     give_instructions(fa)
 
 
+def goodbye():
+    wait_sound(play_sound(THANKING_AUDIO))
+
+
 def fetch_report(port):
     with socket.create_connection((HOST, port), timeout=2.0) as sock:
         sock.sendall(b"objects\n")
@@ -600,10 +609,17 @@ def robot_main(args):
     announced = set()  # camera track ids already said to be too hot
     too_hot_sound = None
     last_problem = None
+    old_term = termios.tcgetattr(sys.stdin) if sys.stdin.isatty() else None
+    if old_term:
+        tty.setcbreak(sys.stdin.fileno())
     try:
         greet(fa)
-        print("Waiting for hot objects (Ctrl+C to stop)...")
+        print("Waiting for hot objects (press 'q' or Ctrl+C to stop)...")
         while True:
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                if sys.stdin.read(1).lower() == "q":
+                    goodbye()
+                    break
             try:
                 report = fetch_report(args.port)
                 problem = report["error"]
@@ -655,6 +671,9 @@ def robot_main(args):
         print("Stopped.")
         if fa is not None:
             fa.stop_skill()
+    finally:
+        if old_term:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
 
 def main():
