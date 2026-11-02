@@ -1,0 +1,4 @@
+# Tested with numpy 2.5.4 and opencv-python 5.0.0.93 on Python 3.13.
+# The Optris SDK (optris.otcsdk) is not on PyPI: it comes from the otcsdk .deb package, see README.
+numpy>=2.0
+opencv-python>=4.8
