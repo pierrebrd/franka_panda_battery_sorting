@@ -1,3 +1,9 @@
+## Installation
+
+Follow the tips in README.md. You do not need to use the setup.sh script, you can make the .venv environment and link the SDK bindings manually.
+
+The "robot" part runs on a docker image on ubuntu. The image and the command used to launch the different programs needed are available in the pdf provided by Caio C.
+
 ## Usage
 
 Do not use push_hot_objects.py, but rather the newer whole_cycle.py, with the --drop argument if you want to drop the objects after picking them, instead of replacing them on the table.
