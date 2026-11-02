@@ -101,9 +101,9 @@ GRIPPER_DOWN = np.array([  # same orientation as the sweep in test_old/test.py
 # ----- greeting ---------------------------------------------------------------------------------
 AUDIO_DIR = HERE / "audios"
 AUDIO_DEVICE = "plughw:1,0"   # plughw instead of hw: aplay then converts any sample rate or channel count
-HELLO_AUDIO = "hello.wav"
-PLACE_OBJECT_AUDIO = "place_object.wav"
-TOO_HOT_AUDIO = "too_hot.wav"     # said once for each hot object, when the robot goes for it
+HELLO_AUDIO = "welcome.wav"
+PLACE_OBJECT_AUDIO = "place_battery.wav"
+TOO_HOT_AUDIO = "battery_too_hot.wav"     # said once for each hot object, when the robot goes for it
 WAVE_AMPLITUDE = np.deg2rad(15)  # side to side around the raised pose
 WAVE_DURATION = 1.0              # s for one swing from side to side
 # Arm stretched forwards, gripper aimed at the centre of the table: the line through the fingers hits
