@@ -40,7 +40,7 @@ You need to use the system Docker socket, not the Docker Desktop one, to avoid l
 - Create a container running that image. The container needs different devices and ports to be able to play sound, create windows, access the network adapter, and it also needs settings to run in real time, which is needed for the robot to work properly. It also needs to mount the workspace. The command to run the container is (run it in a terminal in the root of the repo):
 
 ```bash
-docker run -d --rm --name franka_container \
+docker run -d --name franka_container \
   --net=host --ipc=host \
   --ulimit rtprio=99 --ulimit memlock=-1 --cap-add=sys_nice \
   --security-opt seccomp=unconfined \
