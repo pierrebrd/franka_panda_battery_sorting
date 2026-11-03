@@ -616,6 +616,7 @@ def robot_main(args):
     announced = set()  # camera track ids already said to be too hot
     too_hot_sound = None
     last_problem = None
+    hands_warning_played = False
     old_term = termios.tcgetattr(sys.stdin) if sys.stdin.isatty() else None
     if old_term:
         tty.setcbreak(sys.stdin.fileno())
@@ -647,7 +648,6 @@ def robot_main(args):
                 time.sleep(POLL_PERIOD)
                 continue
 
-            hands_warning_played = False
             if report.get("hand") or any(o.get("touches_border") for o in report["objects"]):
                 print("Hand detected, waiting for hand to be removed...")
                 wait_sound(play_sound(WARNING_AUDIO))
@@ -663,12 +663,14 @@ def robot_main(args):
                     except (OSError, ValueError):
                         break
                 continue
+
             target = max(hot, key=lambda o: o["temp"])
             if target["id"] not in announced:
                 announced.add(target["id"])
                 if not hands_warning_played:
                     wait_sound(too_hot_sound)   # only waits if the previous object was left, without any motion
                     too_hot_sound = play_sound(TOO_HOT_AUDIO)
+                hands_warning_played = False   # Reset the hands warning flag for the next object
             plan = plan_grasp(target, [o for o in report["objects"] if o is not target], args.drop)
             description = "object #{} ({:.1f} C) at x={:.3f} y={:.3f} m".format(target["id"], target["temp"],
                                                                                *target["center"])
