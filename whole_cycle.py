@@ -645,6 +645,7 @@ def robot_main(args):
 
             hot = [o for o in report["objects"] if o["hot"] and not o.get("touches_border") and o["id"] not in done]
             if not hot:
+                hands_warning_played = False
                 time.sleep(POLL_PERIOD)
                 continue
 
@@ -670,7 +671,7 @@ def robot_main(args):
                 if not hands_warning_played:
                     wait_sound(too_hot_sound)   # only waits if the previous object was left, without any motion
                     too_hot_sound = play_sound(TOO_HOT_AUDIO)
-                hands_warning_played = False   # Reset the hands warning flag for the next object
+            hands_warning_played = False   # Reset the hands warning flag for the next object
             plan = plan_grasp(target, [o for o in report["objects"] if o is not target], args.drop)
             description = "object #{} ({:.1f} C) at x={:.3f} y={:.3f} m".format(target["id"], target["temp"],
                                                                                *target["center"])
