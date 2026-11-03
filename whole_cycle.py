@@ -354,7 +354,7 @@ class RobotLink:
         tracks, objects = [], []
         if self.mapping.ready:
             for track in app.tracks:
-                if not track.obj.touches_border and track.age >= STABLE_AGE:
+                if track.age >= STABLE_AGE or track.obj.touches_border:
                     tracks.append(track)
                     objects.append(self._describe(track))
         missing = [i for i in sorted(MARKER_CORNERS) if i not in self.markers_seen]
@@ -366,7 +366,8 @@ class RobotLink:
             error = f"the camera app is in {app.mode} mode"   # e.g. a hot mug used for calibration
         else:
             error = None
-        self.report = {"objects": [] if error else objects, "error": error}
+        hand = any(track.obj.touches_border for track in app.tracks) or any(o.touches_border for o in app.objects)
+        self.report = {"objects": [] if error else objects, "hand": hand, "error": error}
 
         if app.mode == "run":
             self._draw_markers(canvas)
@@ -389,6 +390,7 @@ class RobotLink:
             "hot": temp is not None and temp >= self.threshold,
             "center": np.round(self.mapping.to_robot([track.obj.centroid])[0], 4).tolist(),
             "outline": np.round(self.mapping.to_robot(hull), 4).tolist(),
+            "touches_border": track.obj.touches_border,
         }
 
     def _draw_markers(self, canvas):
@@ -413,6 +415,9 @@ class RobotLink:
     def _draw_object(self, canvas, track, obj, others):
         L = self.app.layout
         x, y, _, h = track.obj.bbox
+        if obj.get("touches_border"):
+            ui.put_text(canvas, "hand", (x * L.rgb_scale, (y + h) * L.rgb_scale + 16), 0.45, ui.YELLOW)
+            return
         text = f"x {obj['center'][0]:.2f}  y {obj['center'][1]:+.2f} m"
         if obj["hot"]:
             text += "  HOT: " + ("grip" if plan_grasp(obj, others, drop=self.drop) is not None else "cannot grip")
@@ -637,15 +642,33 @@ def robot_main(args):
                 time.sleep(1.0)
                 continue
 
-            hot = [o for o in report["objects"] if o["hot"] and o["id"] not in done]
+            hot = [o for o in report["objects"] if o["hot"] and not o.get("touches_border") and o["id"] not in done]
             if not hot:
                 time.sleep(POLL_PERIOD)
+                continue
+
+            hands_warning_played = False
+            if report.get("hand") or any(o.get("touches_border") for o in report["objects"]):
+                print("Hand detected, waiting for hand to be removed...")
+                wait_sound(play_sound(WARNING_AUDIO))
+                hands_warning_played = True
+                while report.get("hand") or any(o.get("touches_border") for o in report.get("objects", [])):
+                    if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                        if sys.stdin.read(1).lower() == "q":
+                            goodbye()
+                            return
+                    time.sleep(POLL_PERIOD)
+                    try:
+                        report = fetch_report(args.port)
+                    except (OSError, ValueError):
+                        break
                 continue
             target = max(hot, key=lambda o: o["temp"])
             if target["id"] not in announced:
                 announced.add(target["id"])
-                wait_sound(too_hot_sound)   # only waits if the previous object was left, without any motion
-                too_hot_sound = play_sound(TOO_HOT_AUDIO)
+                if not hands_warning_played:
+                    wait_sound(too_hot_sound)   # only waits if the previous object was left, without any motion
+                    too_hot_sound = play_sound(TOO_HOT_AUDIO)
             plan = plan_grasp(target, [o for o in report["objects"] if o is not target], args.drop)
             description = "object #{} ({:.1f} C) at x={:.3f} y={:.3f} m".format(target["id"], target["temp"],
                                                                                *target["center"])
